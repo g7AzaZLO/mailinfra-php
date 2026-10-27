@@ -1,0 +1,234 @@
+<?php
+
+declare(strict_types=1);
+
+namespace MailInfra\Tests;
+
+use MailInfra\Exception\WebhookSignatureException;
+use MailInfra\Webhooks;
+use PHPUnit\Framework\TestCase;
+
+final class WebhooksTest extends TestCase
+{
+    /**
+     * Случаи из общих для бэкенда и всех SDK векторов подписи.
+     *
+     * @return list<array<string, mixed>>
+     */
+    private static function vectors(): array
+    {
+        $raw = file_get_contents(SharedResources::path('webhook-signatures.json', 'testdata'));
+        self::assertIsString($raw, 'не прочитать вектора подписи');
+
+        $document = json_decode($raw, true, 512, \JSON_THROW_ON_ERROR);
+        self::assertNotEmpty($document['cases'], 'в векторах нет ни одного случая');
+
+        return $document['cases'];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private static function vector(string $name): array
+    {
+        foreach (self::vectors() as $case) {
+            if ($case['name'] === $name) {
+                return $case;
+            }
+        }
+
+        self::fail("в векторах нет случая {$name}");
+    }
+
+    /**
+     * Подпись считается ровно так же, как на бэкенде: один алгоритм, одни вектора.
+     */
+    public function testSignMatchesVectors(): void
+    {
+        foreach (self::vectors() as $case) {
+            if ($case['valid'] !== true) {
+                continue;
+            }
+            self::assertSame(
+                $case['signature'],
+                Webhooks::sign($case['body'], $case['secret'], $case['timestamp']),
+                "подпись разошлась с бэкендом на случае {$case['name']}",
+            );
+        }
+    }
+
+    public function testVerifyMatchesVectors(): void
+    {
+        foreach (self::vectors() as $case) {
+            self::assertSame(
+                $case['valid'],
+                // Часы заморожены на момент подписи: вектора зафиксированы во
+                // времени и по-настоящему давно протухли.
+                Webhooks::verify($case['body'], $case['secret'], $case['signature_header'], now: $case['timestamp']),
+                "{$case['name']}: {$case['description']}",
+            );
+        }
+    }
+
+    public function testConstructEventReadsPayload(): void
+    {
+        $case = self::vector('delivered_cyrillic_subject');
+
+        $event = Webhooks::constructEvent(
+            $case['body'],
+            $case['secret'],
+            $case['signature_header'],
+            now: $case['timestamp'],
+        );
+
+        self::assertSame('email.delivered', $event->type);
+        self::assertSame('018e1b7a-1111-7000-aaaa-111111111111', $event->emailId());
+        self::assertFalse($event->isTest());
+
+        $email = $event->email();
+        self::assertIsArray($email);
+        self::assertSame('Ваш заказ подтверждён', $email['subject']);
+    }
+
+    public function testTestPingIsRecognized(): void
+    {
+        $case = self::vector('test_ping');
+
+        $event = Webhooks::constructEvent(
+            $case['body'],
+            $case['secret'],
+            $case['signature_header'],
+            now: $case['timestamp'],
+        );
+
+        self::assertTrue($event->isTest());
+        self::assertNull($event->email());
+        self::assertNull($event->emailId());
+    }
+
+    /**
+     * Пустое тело подписывается корректно, но событием не является — это
+     * случай для verify, не для constructEvent.
+     */
+    public function testEmptyBodyIsNotAnEvent(): void
+    {
+        $case = self::vector('empty_body');
+
+        self::assertTrue(
+            Webhooks::verify($case['body'], $case['secret'], $case['signature_header'], now: $case['timestamp']),
+        );
+
+        try {
+            Webhooks::constructEvent(
+                $case['body'],
+                $case['secret'],
+                $case['signature_header'],
+                now: $case['timestamp'],
+            );
+            self::fail('Ожидали WebhookSignatureException');
+        } catch (WebhookSignatureException $exception) {
+            self::assertSame(WebhookSignatureException::REASON_INVALID_JSON, $exception->getReason());
+        }
+    }
+
+    /**
+     * Каждый отказ приходит со своей машинной причиной: по ней в логах видно,
+     * что чинить — конфиг, отправителя или обработчик.
+     *
+     * @dataProvider failureCases
+     */
+    public function testConstructEventFailureReasons(
+        string $bodyKind,
+        string $secretKind,
+        string $headerKind,
+        bool $freezeClock,
+        string $expectedReason,
+    ): void {
+        $case = self::vector('delivered_cyrillic_subject');
+
+        $body = $bodyKind === 'valid' ? $case['body'] : $bodyKind;
+        $secret = $secretKind === 'valid' ? $case['secret'] : $secretKind;
+        $header = match ($headerKind) {
+            'valid' => 't=' . $case['timestamp'] . ',v1=' . Webhooks::sign($body, $case['secret'], $case['timestamp']),
+            default => $headerKind,
+        };
+
+        try {
+            Webhooks::constructEvent(
+                $body,
+                $secret,
+                $header,
+                now: $freezeClock ? $case['timestamp'] : null,
+            );
+            self::fail('Ожидали WebhookSignatureException');
+        } catch (WebhookSignatureException $exception) {
+            self::assertSame($expectedReason, $exception->getReason());
+        }
+    }
+
+    /**
+     * @return iterable<string, array{string, string, string, bool, string}>
+     */
+    public static function failureCases(): iterable
+    {
+        // Типовой источник пустого секрета — getenv() у незаданной переменной:
+        // подпись не совпадёт никогда, и без явной причины это выглядит как
+        // «отправитель шлёт мусор».
+        yield 'пустой secret' => ['valid', '', 'valid', true, WebhookSignatureException::REASON_INVALID_SECRET];
+        // Пустой secret важнее битого заголовка: reason обязан указывать на
+        // конфиг получателя, а не на отправителя.
+        yield 'пустой secret важнее битого заголовка' => [
+            'valid', '', 't=1715461200', true, WebhookSignatureException::REASON_INVALID_SECRET,
+        ];
+        yield 'заголовок без v1' => [
+            'valid', 'valid', 't=1715461200', true, WebhookSignatureException::REASON_MALFORMED_HEADER,
+        ];
+        yield 'нечисловой timestamp' => [
+            'valid', 'valid', 't=вчера,v1=abc', true, WebhookSignatureException::REASON_MALFORMED_HEADER,
+        ];
+        yield 'пустой заголовок' => [
+            'valid', 'valid', '', true, WebhookSignatureException::REASON_MALFORMED_HEADER,
+        ];
+        yield 'чужой secret' => [
+            'valid', 'whsec_другой', 'valid', true, WebhookSignatureException::REASON_SIGNATURE_MISMATCH,
+        ];
+        // Защита от replay: часы не заморожены, а вектор давно протух.
+        yield 'протухшая подпись' => [
+            'valid', 'valid', 'valid', false, WebhookSignatureException::REASON_TOO_OLD,
+        ];
+        yield 'тело не объект' => [
+            '["не","событие"]', 'valid', 'valid', true, WebhookSignatureException::REASON_INVALID_JSON,
+        ];
+        yield 'тело не JSON' => [
+            '<html>502</html>', 'valid', 'valid', true, WebhookSignatureException::REASON_INVALID_JSON,
+        ];
+        yield 'объект не по контракту' => [
+            '{"hello":"world"}', 'valid', 'valid', true, WebhookSignatureException::REASON_INVALID_PAYLOAD,
+        ];
+    }
+
+    /**
+     * Пробелы вокруг частей допускает и HTTP, и нормализующие прокси: заголовок
+     * `t=…, v1=…` обязан приниматься всеми SDK одинаково.
+     */
+    public function testSignatureHeaderToleratesSpaces(): void
+    {
+        $case = self::vector('delivered_cyrillic_subject');
+        $spaced = 't=' . $case['timestamp'] . ', v1=' . $case['signature'];
+
+        self::assertTrue(Webhooks::verify($case['body'], $case['secret'], $spaced, now: $case['timestamp']));
+    }
+
+    /**
+     * Нулевой возраст отключает проверку времени — иногда это нужно при разборе
+     * архивных доставок.
+     */
+    public function testZeroMaxAgeDisablesAgeCheck(): void
+    {
+        $case = self::vector('delivered_cyrillic_subject');
+
+        self::assertTrue(
+            Webhooks::verify($case['body'], $case['secret'], $case['signature_header'], maxAgeSeconds: 0),
+        );
+    }
+}
