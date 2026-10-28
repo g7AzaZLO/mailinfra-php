@@ -9,12 +9,16 @@ use MailInfra\Exception\AuthenticationException;
 use MailInfra\Exception\BadRequestException;
 use MailInfra\Exception\ConflictException;
 use MailInfra\Exception\DomainNotVerifiedException;
+use MailInfra\Exception\EmailNotScheduledException;
 use MailInfra\Exception\IdempotencyInFlightException;
+use MailInfra\Exception\IpNotAllowedException;
 use MailInfra\Exception\MailInfraException;
 use MailInfra\Exception\NotFoundException;
 use MailInfra\Exception\PermissionDeniedException;
 use MailInfra\Exception\RateLimitException;
 use MailInfra\Exception\SandboxTrialExhaustedException;
+use MailInfra\Exception\SendAtInvalidException;
+use MailInfra\Exception\SendAtTooFarException;
 use MailInfra\Exception\ServerException;
 use MailInfra\Exception\UnprocessableException;
 use MailInfra\RetryPolicy;
@@ -124,6 +128,34 @@ final class ErrorsTest extends TestCase
         yield 'idempotency_in_flight' => [
             409, 'idempotency_in_flight', IdempotencyInFlightException::class, ConflictException::class,
         ];
+        yield 'email_not_scheduled' => [
+            409, 'email_not_scheduled', EmailNotScheduledException::class, ConflictException::class,
+        ];
+        yield 'send_at_too_far' => [400, 'send_at_too_far', SendAtTooFarException::class, BadRequestException::class];
+        yield 'send_at_invalid' => [400, 'send_at_invalid', SendAtInvalidException::class, BadRequestException::class];
+        yield 'ip_not_allowed' => [
+            403, 'ip_not_allowed', IpNotAllowedException::class, PermissionDeniedException::class,
+        ];
+    }
+
+    /**
+     * Отказ отмены приходит конвертом бэкенда как есть: код в error.code и
+     * в details.code, текущий статус письма — в details.status. По нему
+     * повтор отмены отличает «уже отменено» от «уже отправлено».
+     */
+    public function testEmailNotScheduledCarriesStatus(): void
+    {
+        $http = new StubHttpClient(StubHttpClient::json(409, '{"error":{"code":"email_not_scheduled",
+            "message":"Письмо уже не запланировано","details":{"code":"email_not_scheduled","status":"CANCELED"}},
+            "request_id":"req-5"}'));
+
+        try {
+            $this->client($http)->emails->cancel('018e1b7a-1111-7000-aaaa-111111111111');
+            self::fail('Ожидали EmailNotScheduledException');
+        } catch (EmailNotScheduledException $exception) {
+            self::assertSame('CANCELED', $exception->getDetails()['status']);
+            self::assertCount(1, $http->requests, '409 не повторяется');
+        }
     }
 
     /**

@@ -21,6 +21,7 @@ use MailInfra\Exception\MailInfraException;
 use MailInfra\Exception\MalformedResponseException;
 use MailInfra\Http\CurlHttpClient;
 use MailInfra\Http\HttpClientInterface;
+use MailInfra\Http\HttpResponse;
 use MailInfra\Http\TransportException;
 use MailInfra\Internal\ApiResponse;
 use MailInfra\Resource\Emails;
@@ -43,7 +44,7 @@ use MailInfra\Resource\Emails;
 class MailInfra
 {
     /** Версия SDK; уезжает в `User-Agent` каждого запроса. */
-    public const VERSION = '0.1.0';
+    public const VERSION = '0.2.0';
 
     /** Переменная окружения с API-ключом проекта. */
     public const API_KEY_ENV_VAR = 'MAILINFRA_API_KEY';
@@ -73,7 +74,7 @@ class MailInfra
         'mi_TEST_' => Environment::Test,
     ];
 
-    /** Письма: `send`, `sendBatch`, `get`, `list`, `events`. */
+    /** Письма: `send`, `sendBatch`, `get`, `list`, `listAll`, `events`, `cancel`, `reschedule`. */
     public readonly Emails $emails;
 
     /** Действующая политика повторов. */
@@ -214,12 +215,7 @@ class MailInfra
             $requestId = $response->header(self::REQUEST_ID_HEADER);
 
             if ($response->isSuccessful()) {
-                return new ApiResponse(
-                    data: self::unwrap($decoded, $response->statusCode, $requestId),
-                    statusCode: $response->statusCode,
-                    headers: $response->headers,
-                    requestId: $requestId,
-                );
+                return self::successResponse($response, $decoded, $requestId);
             }
 
             $retryAfter = RetryPolicy::parseRetryAfter($response->header('Retry-After'));
@@ -287,25 +283,34 @@ class MailInfra
     }
 
     /**
-     * Достаёт поле `data` из успешного ответа.
+     * Собирает ответ ресурсу из успешного ответа транспорта.
+     *
+     * Кроме поля `data` сохраняется и весь объект ответа: у списка писем рядом
+     * с `data` лежат `has_more` и `next_cursor`.
      *
      * @throws MalformedResponseException Если ответ успешен, но не по контракту —
      *                                    иначе поломка API всплыла бы невнятной
      *                                    ошибкой при разборе модели.
      */
-    private static function unwrap(mixed $decoded, int $statusCode, ?string $requestId): mixed
+    private static function successResponse(HttpResponse $response, mixed $decoded, ?string $requestId): ApiResponse
     {
         if (!\is_array($decoded) || !\array_key_exists('data', $decoded)) {
             throw new MalformedResponseException(
                 "Ответ API не по контракту: ожидался объект с полем 'data'",
-                $statusCode,
+                $response->statusCode,
                 'malformed_response',
                 [],
                 $requestId,
             );
         }
 
-        return $decoded['data'];
+        return new ApiResponse(
+            data: $decoded['data'],
+            statusCode: $response->statusCode,
+            headers: $response->headers,
+            requestId: $requestId,
+            body: $decoded,
+        );
     }
 
     /**

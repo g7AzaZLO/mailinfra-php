@@ -28,12 +28,14 @@ WordPress и Laravel-сборок постарше).
 
 | Возможность | Подробности |
 |---|---|
-| Идемпотентность | На каждую отправку ставится `Idempotency-Key`, и он **переиспользуется при повторах** — обрыв сети не превращается в два письма |
+| Идемпотентность | На каждую отправку и каждый батч ставится `Idempotency-Key`, и он **переиспользуется при повторах** — обрыв сети не превращается в два письма |
 | Повторы | `429`, `408/425`, `5xx` и сетевые сбои повторяются с экспоненциальным backoff и half-jitter |
 | Rate limit | `Retry-After` уважается как есть; слишком долгий (>60 с) не блокирует поток, а приходит как `RateLimitException::getRetryAfter()` |
 | Типизированные ошибки | `DomainNotVerifiedException`, `RateLimitException`, `UnprocessableException::getFields()` и ещё ~20 классов |
+| Пагинация | `listAll()` сам идёт по курсору и запрашивает страницы по мере обхода |
+| Проверка до сети | Лимиты получателей, тегов, вложений, `metadata` и `ttl`, часовой пояс `sendAt` |
 | Типы | Enum'ы для статусов и причин отказа, readonly-модели для ответов |
-| Вебхуки | `Webhooks::constructEvent()` — проверка HMAC-подписи и разбор события |
+| Вебхуки | `Webhooks::constructEvent()` — проверка HMAC-подписи (в том числе во время ротации секрета) и разбор события |
 
 ## Аутентификация
 
@@ -83,6 +85,88 @@ $client->emails->send(
 `Attachment::fromContent()` возьмёт содержимое из строки, `Attachment::fromBase64()` —
 готовый base64.
 
+### Inline-картинки
+
+Вложение с `contentId` встраивается в письмо, а не прикладывается файлом: в HTML на
+него ссылаются как `cid:<contentId>`.
+
+```php
+$client->emails->send(
+    from: 'hello@mail.example.ru',
+    to: 'user@example.com',
+    subject: 'Новая коллекция',
+    html: '<p><img src="cid:logo" alt="Логотип"></p>',
+    attachments: [
+        Attachment::fromFile('/var/www/logo.png', contentType: 'image/png', contentId: 'logo'),
+    ],
+);
+```
+
+### Метаданные письма
+
+```php
+$client->emails->send(
+    from: 'billing@mail.example.ru',
+    to: 'user@example.com',
+    subject: 'Счёт A-1024',
+    text: 'Счёт во вложении.',
+    metadata: ['order_id' => 'A-1024', 'user_id' => '7'],
+);
+```
+
+`metadata` — ваши пары «ключ — значение»: они возвращаются в `list()` и `get()`
+(`$email->metadata`) и в каждом вебхуке письма (`$event->metadata()`), так что событие
+легко связать с заказом в своей системе. До 20 ключей; ключ — до 40 символов из
+латиницы, цифр, `_`, `-` и `.`; значение — строка до 500 символов; весь объект — до
+4096 байт JSON. Лимиты проверяются до сети.
+
+### Отложенная отправка
+
+```php
+use MailInfra\Enum\EmailStatus;
+
+$result = $client->emails->send(
+    from: 'hello@mail.example.ru',
+    to: 'user@example.com',
+    subject: 'Напоминание об оплате',
+    html: '<p>Заказ A-1024 ждёт оплаты</p>',
+    sendAt: new DateTimeImmutable('+1 day'),
+);
+// $result->status === EmailStatus::Scheduled
+
+// Пользователь оплатил — напоминание больше не нужно.
+$client->emails->cancel($result->id);
+
+// Или перенести на другое время.
+$client->emails->reschedule($result->id, sendAt: '2026-11-02T09:00:00+03:00');
+```
+
+`sendAt` — не дальше 7 дней вперёд; время в прошлом означает «отправить сразу».
+`DateTimeInterface` уходит в API в UTC, строка — как есть, и в ней обязателен
+часовой пояс: строку вида `date('Y-m-d H:i:s')` SDK отклонит до сети, иначе API не
+понял бы, чьё это время. Отменить и перенести можно только письмо в статусе
+`SCHEDULED` — иначе придёт `EmailNotScheduledException`, а дальше 7 дней —
+`SendAtTooFarException`. Для отмены и переноса нужно то же право ключа, что для
+отправки. После `5xx` и сбоя сети SDK повторяет `cancel()` сам: дважды письмо не
+отменится, а если первая попытка всё-таки дошла, повтор получит
+`EmailNotScheduledException` с `CANCELED` в `getDetails()['status']` — это тоже успех.
+
+### Срок жизни письма
+
+```php
+$client->emails->send(
+    from: 'auth@mail.example.ru',
+    to: 'user@example.com',
+    subject: 'Код входа',
+    text: 'Ваш код: 4821',
+    ttl: 300, // через 5 минут код уже не нужен
+);
+```
+
+`ttl` — от 60 секунд до суток, отсчёт от `sendAt` или от приёма письма. Не дошедшее
+за это время письмо больше не отправляется и не повторяется: статус `FAILED` с
+причиной `expired` или отказ с категорией `BounceCategory::DeliveryExpired`.
+
 ### Свой ключ идемпотентности
 
 ```php
@@ -118,10 +202,23 @@ foreach ($batch->failed() as $item) {
 }
 ```
 
-Ключи элемента — те же, что у `send()`. До 100 писем за раз. `Idempotency-Key` этот
-эндпоинт не принимает: бэкенд коммитит письма батча по одному, поэтому SDK не повторяет
-его после `5xx`, таймаута и обрыва соединения. Повторяется только `429` — лимитёр
-отказывает до приёма писем.
+Ключи элемента — те же, что у `send()`, включая `metadata`, `sendAt` и `ttl`. До 100
+писем за раз. `Idempotency-Key` у батча один на весь запрос, и SDK ставит его сам, как
+у `send()`: бэкенд выводит из него ключ каждого письма, поэтому повтор после `5xx`,
+таймаута или обрыва соединения не дублирует уже принятые письма, а отклонённые пробует
+принять заново.
+
+```php
+$batch = $client->emails->sendBatch($emails, idempotencyKey: 'digest-2026-11-01');
+
+if ($batch->replayed) {
+    // все принятые письма были приняты прежним запросом с этим ключом
+}
+```
+
+Свой ключ батча — до 252 символов: бэкенд дописывает к нему номер письма. Без ключа
+(`withoutIdempotencyKey: true`) письма батча коммитятся по одному без защиты от дублей,
+и SDK повторяет такой батч только на `429` — лимитёр отказывает до приёма писем.
 
 ## Чтение
 
@@ -130,18 +227,40 @@ use MailInfra\Enum\EmailStatus;
 
 $email = $client->emails->get($emailId);
 
-$emails = $client->emails->list(
-    status: EmailStatus::Bounced,
-    tag: 'order',
-    from: new DateTimeImmutable('-24 hours'),
-    limit: 50,
-);
+$filters = [
+    'status' => EmailStatus::Bounced,
+    'tag' => 'order',
+    'from' => new DateTimeImmutable('-24 hours'),
+    'limit' => 50,
+];
+$page = $client->emails->list(...$filters);
+foreach ($page->data as $item) {
+    // …
+}
+if ($page->hasMore) {
+    $next = $client->emails->list(...$filters, cursor: $page->nextCursor);
+}
 
 $events = $client->emails->events($emailId);
 ```
 
 `from` и `to` в `list()` — это интервал по времени создания письма, а не адреса; адреса
 фильтруются через `fromEmail` и `toEmail`. Время уходит в API в UTC.
+
+`list()` возвращает одну страницу `EmailListPage`, новые письма сначала. Следующая —
+тот же вызов с теми же фильтрами и `cursor: $page->nextCursor`: курсор помнит место в
+выборке, но не фильтры. Обойти все страницы без ручной работы с курсором —
+`listAll()`:
+
+```php
+foreach ($client->emails->listAll(status: EmailStatus::Bounced, limit: 100) as $email) {
+    suppressLocally($email->toEmails);
+}
+```
+
+`listAll()` — генератор: следующая страница запрашивается, когда до неё дошёл
+`foreach`, поэтому `break` не тянет лишних страниц, а ошибка API всплывает на итерации,
+а не при вызове. `limit` здесь — размер страницы, а не потолок обхода.
 
 ## Ошибки
 
@@ -181,7 +300,9 @@ try {
   `AllRecipientsSuppressedException`, `TemplateRenderException`,
   `TemplateVariableMissingException`, `ReservedEmailHeaderException`,
   `SandboxRecipientNotAllowedException`, `SandboxTrialExhaustedException`,
-  `IdempotencyInFlightException`, `LegalDocumentsNotAcceptedException`.
+  `IdempotencyInFlightException`, `LegalDocumentsNotAcceptedException`,
+  `EmailNotScheduledException`, `SendAtTooFarException`, `SendAtInvalidException`,
+  `IpNotAllowedException` (ключ использован с IP-адреса вне его белого списка).
 
 Конкретная причина всегда наследует свою категорию: `catch (UnprocessableException $e)`
 поймает и `DomainNotVerifiedException`. Порядок `catch` важен — конкретные классы идут
@@ -248,8 +369,9 @@ try {
 }
 
 match ($event->type) {
-    'email.bounced' => handleBounce($event->emailId()),
+    'email.bounced' => handleBounce($event->emailId(), $event->metadata()['order_id'] ?? null),
     'email.delivered' => handleDelivered($event->emailId()),
+    'email.canceled' => handleCanceled($event->emailId()),
     default => null,
 };
 ```
@@ -257,6 +379,14 @@ match ($event->type) {
 Тело обязательно брать **сырым** (`php://input`), а не из `$_POST`: пересериализованный
 JSON даст другие байты и подпись не сойдётся. Подписи старше 5 минут отклоняются —
 окно меняется аргументом `maxAgeSeconds`, `0` отключает проверку.
+
+Во время ротации секрета MailInfra подписывает доставку дважды — новым секретом и
+прежним: `t=…,v1=<новым>,v1=<прежним>`. SDK сверяет каждую подпись и принимает
+доставку, если совпала любая, поэтому переключить `MAILINFRA_WEBHOOK_SECRET` на новый
+секрет можно в любой момент окна ротации — доставки не начнут отклоняться.
+
+`$event->metadata()` — `metadata`, переданное при отправке письма. Отложенные письма
+дают события `email.scheduled` (запланировано или перенесено) и `email.canceled`.
 
 ## Что пока не покрыто
 

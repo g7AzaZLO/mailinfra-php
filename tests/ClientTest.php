@@ -101,6 +101,21 @@ final class ClientTest extends TestCase
         self::assertSame('application/json', $headers['Content-Type']);
     }
 
+    /**
+     * Версию релиза скрипт выкладки берёт из верхнего раздела CHANGELOG, а
+     * User-Agent — из константы: разъехавшись, они записали бы в логи
+     * поддержки не ту версию SDK.
+     */
+    public function testVersionMatchesChangelog(): void
+    {
+        $changelog = file_get_contents(__DIR__ . '/../CHANGELOG.md');
+        self::assertIsString($changelog);
+        $found = preg_match('/^## \[(\d+\.\d+\.\d+)\]/m', $changelog, $match);
+        self::assertSame(1, $found, 'в CHANGELOG нет раздела версии');
+
+        self::assertSame($match[1] ?? null, MailInfra::VERSION);
+    }
+
     public function testUserAgentSuffix(): void
     {
         $http = new StubHttpClient(StubHttpClient::acceptedSend());

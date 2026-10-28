@@ -12,6 +12,8 @@ namespace MailInfra\Enum;
  */
 enum EmailStatus: string
 {
+    /** Отложенная отправка (`send_at`): ждёт своего времени, его можно отменить или перенести. */
+    case Scheduled = 'SCHEDULED';
     case Queued = 'QUEUED';
     case Sending = 'SENDING';
     case Sent = 'SENT';
@@ -20,4 +22,6 @@ enum EmailStatus: string
     case Complained = 'COMPLAINED';
     case Failed = 'FAILED';
     case Simulated = 'SIMULATED';
+    /** Запланированное письмо отменено до отправки. */
+    case Canceled = 'CANCELED';
 }

@@ -35,8 +35,9 @@ final class ErrorFactory
      * Конкретные причины по `error.code`.
      *
      * Источник истины — места `raise` в app.services.{email_service,
-     * template_service, idempotency, rate_limit}: только они говорят, какой код
-     * реально выбрасывается и с каким статусом.
+     * scheduled_email_service, template_service, idempotency, rate_limit} и
+     * app.api.api_auth: только они говорят, какой код реально выбрасывается и
+     * с каким статусом.
      *
      * @var array<string, class-string<MailInfraException>>
      */
@@ -44,12 +45,16 @@ final class ErrorFactory
         'all_recipients_suppressed' => AllRecipientsSuppressedException::class,
         'domain_not_attached' => DomainNotAttachedException::class,
         'domain_not_verified' => DomainNotVerifiedException::class,
+        'email_not_scheduled' => EmailNotScheduledException::class,
         'idempotency_in_flight' => IdempotencyInFlightException::class,
+        'ip_not_allowed' => IpNotAllowedException::class,
         'legal_documents_not_accepted' => LegalDocumentsNotAcceptedException::class,
         'reserved_email_header' => ReservedEmailHeaderException::class,
         'rps_exceeded' => RateLimitException::class,
         'sandbox_recipient_not_allowed' => SandboxRecipientNotAllowedException::class,
         'sandbox_trial_exhausted' => SandboxTrialExhaustedException::class,
+        'send_at_invalid' => SendAtInvalidException::class,
+        'send_at_too_far' => SendAtTooFarException::class,
         'template_render_error' => TemplateRenderException::class,
         'template_variable_missing' => TemplateVariableMissingException::class,
     ];

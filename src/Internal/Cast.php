@@ -73,6 +73,19 @@ final class Cast
     /**
      * @param array<string, mixed> $data
      */
+    public static function bool(array $data, string $key): bool
+    {
+        $value = $data[$key] ?? null;
+        if (!\is_bool($value)) {
+            throw self::malformed($key, 'булево значение', $value);
+        }
+
+        return $value;
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     */
     public static function nullableBool(array $data, string $key): ?bool
     {
         $value = $data[$key] ?? null;
@@ -170,6 +183,32 @@ final class Cast
         }
 
         return $value;
+    }
+
+    /**
+     * Список объектов, которые дальше разбирает модель: письма страницы,
+     * результаты батча. Поле обязательно — без него ответ не по контракту.
+     *
+     * @param array<string, mixed> $data
+     *
+     * @return list<array<string, mixed>>
+     */
+    public static function objectList(array $data, string $key): array
+    {
+        $value = $data[$key] ?? null;
+        if (!\is_array($value) || !array_is_list($value)) {
+            throw self::malformed($key, 'список объектов', $value);
+        }
+
+        $result = [];
+        foreach ($value as $item) {
+            if (!\is_array($item)) {
+                throw self::malformed($key, 'список объектов', $value);
+            }
+            $result[] = $item;
+        }
+
+        return $result;
     }
 
     /**

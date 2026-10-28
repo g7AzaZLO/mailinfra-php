@@ -5,9 +5,9 @@
  *
  * Python и Node SDK получают модели кодогенератором, PHP-классы написаны
  * руками — значит, разойтись со спекой они могут молча. Этот тест читает
- * https://docs.mailinfra.ru/openapi/mailinfra-public.json и требует, чтобы совпадали три вещи:
- * состав полей каждой модели, значения перечислений и числовые ограничения
- * запроса из Limits.
+ * https://docs.mailinfra.ru/openapi/mailinfra-public.json и требует, чтобы совпадали четыре вещи:
+ * состав полей каждой модели, значения перечислений, числовые ограничения
+ * запроса из Limits и аргументы методов — поля тела и query-параметры.
  *
  * Если тест красный — спека уехала вперёд: допишите поле, значение или
  * поправьте константу. Спека правится только через backend/scripts/gen_openapi.py.
@@ -32,11 +32,28 @@ use MailInfra\Model\BatchSendResult;
 use MailInfra\Model\EmailDetail;
 use MailInfra\Model\EmailEvent;
 use MailInfra\Model\EmailListItem;
+use MailInfra\Model\EmailListPage;
+use MailInfra\Model\EmailScheduleData;
 use MailInfra\Model\SendResult;
+use MailInfra\Resource\Emails;
 use PHPUnit\Framework\TestCase;
 
 final class SpecParityTest extends TestCase
 {
+    /**
+     * Метаданные запроса, которые результат отправки несёт сверх схемы ответа.
+     *
+     * @var list<string>
+     */
+    private const REQUEST_META_FIELDS = ['idempotency_key', 'replayed', 'request_id'];
+
+    /**
+     * Аргументы send(), которые уходят заголовком, а не полем тела.
+     *
+     * @var list<string>
+     */
+    private const IDEMPOTENCY_ARGUMENTS = ['idempotencyKey', 'withoutIdempotencyKey'];
+
     /**
      * @return array<string, mixed>
      */
@@ -76,10 +93,38 @@ final class SpecParityTest extends TestCase
         $constructor = (new \ReflectionClass($class))->getConstructor();
         self::assertNotNull($constructor, "у {$class} нет конструктора");
 
-        $fields = [];
-        foreach ($constructor->getParameters() as $parameter) {
-            $fields[] = strtolower((string) preg_replace('/(?<!^)[A-Z]/', '_$0', $parameter->getName()));
-        }
+        return self::wireNames(array_map(
+            static fn (\ReflectionParameter $parameter) => $parameter->getName(),
+            $constructor->getParameters(),
+        ));
+    }
+
+    /**
+     * Аргументы метода ресурса писем.
+     *
+     * @return list<string>
+     */
+    private static function arguments(string $method): array
+    {
+        return array_map(
+            static fn (\ReflectionParameter $parameter) => $parameter->getName(),
+            (new \ReflectionMethod(Emails::class, $method))->getParameters(),
+        );
+    }
+
+    /**
+     * camelCase → snake_case, отсортированно.
+     *
+     * @param list<string> $names
+     *
+     * @return list<string>
+     */
+    private static function wireNames(array $names): array
+    {
+        $fields = array_map(
+            static fn (string $name) => strtolower((string) preg_replace('/(?<!^)[A-Z]/', '_$0', $name)),
+            $names,
+        );
         sort($fields);
 
         return $fields;
@@ -122,22 +167,72 @@ final class SpecParityTest extends TestCase
         yield 'EmailEventPublic' => [EmailEvent::class, 'EmailEventPublic'];
         yield 'BatchSendError' => [BatchSendError::class, 'BatchSendError'];
         yield 'BatchSendResult' => [BatchSendResult::class, 'BatchSendResult'];
+        yield 'EmailListResponse' => [EmailListPage::class, 'EmailListResponse'];
+        yield 'EmailScheduleData' => [EmailScheduleData::class, 'EmailScheduleData'];
+    }
+
+    /**
+     * Результаты отправки добавляют к схеме метаданные запроса, которых в теле
+     * ответа нет: флаг повтора, ключ идемпотентности и request_id. Кроме них —
+     * ровно поля схемы.
+     *
+     * @dataProvider sendResults
+     *
+     * @param class-string $class
+     */
+    public function testSendResultsMatchSpecPlusRequestMeta(string $class, string $schema): void
+    {
+        $fields = self::wireFields($class);
+
+        foreach (self::REQUEST_META_FIELDS as $field) {
+            self::assertContains($field, $fields);
+        }
+        self::assertSame(self::schemaFields($schema), array_values(array_diff($fields, self::REQUEST_META_FIELDS)));
+    }
+
+    /**
+     * @return iterable<string, array{class-string, string}>
+     */
+    public static function sendResults(): iterable
+    {
+        yield 'EmailSendResponseData' => [SendResult::class, 'EmailSendResponseData'];
         yield 'BatchSendResponseData' => [BatchSendResponseData::class, 'BatchSendResponseData'];
     }
 
     /**
-     * SendResult добавляет к схеме метаданные запроса, которых в теле ответа
-     * нет, но все поля схемы обязан нести.
+     * Каждое поле тела отправки — аргумент send(), и элемент батча принимает
+     * ровно те же ключи: новое поле API не может доехать до одной формы
+     * отправки и забыться в другой.
      */
-    public function testSendResultCoversResponseSchema(): void
+    public function testSendArgumentsMatchRequestSchema(): void
     {
-        $fields = self::wireFields(SendResult::class);
+        $bodyArguments = array_values(array_diff(self::arguments('send'), self::IDEMPOTENCY_ARGUMENTS));
 
-        foreach (self::schemaFields('EmailSendResponseData') as $field) {
-            self::assertContains($field, $fields);
+        self::assertSame(self::schemaFields('EmailSendRequest'), self::wireNames($bodyArguments));
+
+        $batchKeys = (new \ReflectionClassConstant(Emails::class, 'BATCH_ITEM_KEYS'))->getValue();
+        self::assertIsArray($batchKeys);
+        sort($batchKeys);
+        sort($bodyArguments);
+        self::assertSame($bodyArguments, $batchKeys);
+    }
+
+    /**
+     * У list() есть аргумент на каждый query-параметр GET /emails, а listAll()
+     * принимает те же аргументы, что и list().
+     */
+    public function testListArgumentsMatchQueryParameters(): void
+    {
+        $query = [];
+        foreach (self::spec()['paths']['/emails']['get']['parameters'] as $parameter) {
+            if ($parameter['in'] === 'query') {
+                $query[] = $parameter['name'];
+            }
         }
-        self::assertContains('replayed', $fields);
-        self::assertContains('idempotency_key', $fields);
+        sort($query);
+
+        self::assertSame($query, self::wireNames(self::arguments('list')));
+        self::assertSame(self::arguments('list'), self::arguments('listAll'));
     }
 
     /**
@@ -189,7 +284,10 @@ final class SpecParityTest extends TestCase
         self::assertIsArray($property, "в спеке нет поля {$field} у {$schema}");
         self::assertArrayHasKey($keyword, $property, "в спеке нет {$keyword} у {$field}");
 
-        self::assertSame($property[$keyword], $expected);
+        // Сравниваем значения, а не тип литерала: minimum/maximum спека отдаёт
+        // как 60.0, а maxItems — как 50, и оба — одно и то же целое число.
+        self::assertIsNumeric($property[$keyword]);
+        self::assertSame((float) $property[$keyword], (float) $expected);
     }
 
     /**
@@ -211,26 +309,53 @@ final class SpecParityTest extends TestCase
         yield 'content_base64' => [
             'EmailAttachmentInput', 'content_base64', 'maxLength', Limits::MAX_ATTACHMENT_BASE64_LENGTH,
         ];
+        yield 'content_id' => ['EmailAttachmentInput', 'content_id', 'maxLength', Limits::MAX_CONTENT_ID_LENGTH];
+        yield 'ttl min' => ['EmailSendRequest', 'ttl', 'minimum', Limits::MIN_TTL_SECONDS];
+        yield 'ttl max' => ['EmailSendRequest', 'ttl', 'maximum', Limits::MAX_TTL_SECONDS];
         yield 'emails' => ['BatchSendRequest', 'emails', 'maxItems', Limits::MAX_BATCH_SIZE];
     }
 
     /**
-     * Потолок длины Idempotency-Key взят из описания самого заголовка, а не из
-     * тела запроса.
+     * Лимиты metadata спека называет только текстом описания поля — сверяем с
+     * ним, чтобы поднятый на бэкенде лимит не остался в SDK старым молча.
      */
-    public function testIdempotencyKeyLimitMatchesSpec(): void
+    public function testMetadataLimitsMatchSpecDescription(): void
     {
-        $parameters = self::spec()['paths']['/emails']['post']['parameters'] ?? [];
+        $description = self::schema('EmailSendRequest')['properties']['metadata']['description'] ?? '';
+        self::assertIsString($description);
+
+        self::assertStringContainsString('До ' . Limits::MAX_METADATA_KEYS . ' ключей', $description);
+        self::assertStringContainsString('до ' . Limits::MAX_METADATA_VALUE_LENGTH . ' символов', $description);
+    }
+
+    /**
+     * Потолок длины Idempotency-Key взят из описания самого заголовка, а не из
+     * тела запроса. У батча он свой: бэкенд дописывает к ключу номер письма.
+     *
+     * @dataProvider idempotencyKeyLimits
+     */
+    public function testIdempotencyKeyLimitMatchesSpec(string $path, int $expected): void
+    {
+        $parameters = self::spec()['paths'][$path]['post']['parameters'] ?? [];
 
         foreach ($parameters as $parameter) {
             if ($parameter['in'] === 'header' && $parameter['name'] === 'Idempotency-Key') {
-                self::assertSame($parameter['schema']['maxLength'], Limits::IDEMPOTENCY_KEY_MAX_LENGTH);
+                self::assertSame($parameter['schema']['maxLength'], $expected);
 
                 return;
             }
         }
 
-        self::fail('в спеке нет заголовка Idempotency-Key у POST /emails');
+        self::fail("в спеке нет заголовка Idempotency-Key у POST {$path}");
+    }
+
+    /**
+     * @return iterable<string, array{string, int}>
+     */
+    public static function idempotencyKeyLimits(): iterable
+    {
+        yield 'POST /emails' => ['/emails', Limits::IDEMPOTENCY_KEY_MAX_LENGTH];
+        yield 'POST /emails/batch' => ['/emails/batch', Limits::BATCH_IDEMPOTENCY_KEY_MAX_LENGTH];
     }
 
     /**
@@ -246,8 +371,15 @@ final class SpecParityTest extends TestCase
             'POST /emails/batch' => 'emails->sendBatch',
             'GET /emails' => 'emails->list',
             'GET /emails/{email_id}' => 'emails->get',
+            'PATCH /emails/{email_id}' => 'emails->reschedule',
+            'POST /emails/{email_id}/cancel' => 'emails->cancel',
             'GET /emails/{email_id}/events' => 'emails->events',
         ];
+
+        foreach ($covered as $operation => $method) {
+            $name = substr($method, \strlen('emails->'));
+            self::assertTrue(method_exists(Emails::class, $name), "для {$operation} нет метода {$method}");
+        }
 
         $operations = [];
         foreach (self::spec()['paths'] as $path => $item) {

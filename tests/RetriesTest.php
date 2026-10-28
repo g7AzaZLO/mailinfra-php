@@ -36,11 +36,12 @@ final class RetriesTest extends TestCase
         );
     }
 
-    private function sendBatch(TestableMailInfra $client): void
+    private function sendBatch(TestableMailInfra $client, bool $withoutIdempotencyKey = false): void
     {
-        $client->emails->sendBatch([
-            ['from' => 'hello@mail.example.ru', 'to' => 'a@example.com', 'subject' => 'Раз', 'text' => '1'],
-        ]);
+        $client->emails->sendBatch(
+            [['from' => 'hello@mail.example.ru', 'to' => 'a@example.com', 'subject' => 'Раз', 'text' => '1']],
+            withoutIdempotencyKey: $withoutIdempotencyKey,
+        );
     }
 
     /**
@@ -141,33 +142,73 @@ final class RetriesTest extends TestCase
     }
 
     /**
-     * Батч неидемпотентен: повтор после 5xx отправил бы часть писем второй раз.
+     * Батч с ключом повторяется после 5xx с тем же ключом: бэкенд выводит из
+     * него ключ каждого письма и уже принятые письма второй раз не принимает.
      */
-    public function testBatchIsNotRetriedOnServerError(): void
+    public function testBatchWithKeyIsRetriedWithSameKey(): void
+    {
+        $http = new StubHttpClient(
+            StubHttpClient::error(503, 'unavailable', 'позже'),
+            StubHttpClient::acceptedBatch(),
+        );
+
+        $this->sendBatch($this->client($http));
+
+        self::assertCount(2, $http->requests);
+        self::assertSame(
+            $http->requests[0]['headers']['Idempotency-Key'],
+            $http->requests[1]['headers']['Idempotency-Key'],
+        );
+    }
+
+    /**
+     * Батч без ключа неидемпотентен: повтор после 5xx отправил бы часть писем
+     * второй раз.
+     */
+    public function testBatchWithoutKeyIsNotRetriedOnServerError(): void
     {
         $http = new StubHttpClient(StubHttpClient::error(503, 'unavailable', 'позже'));
 
         $this->expectException(ServerException::class);
 
         try {
-            $this->sendBatch($this->client($http));
+            $this->sendBatch($this->client($http), withoutIdempotencyKey: true);
         } finally {
             self::assertCount(1, $http->requests);
         }
     }
 
     /**
-     * 429 у батча повторяется: лимитёр отказывает до приёма писем, значит
-     * ничего не принято.
+     * 429 у батча повторяется даже без ключа: лимитёр отказывает до приёма
+     * писем, значит ничего не принято.
      */
-    public function testBatchIsRetriedOnRateLimit(): void
+    public function testBatchWithoutKeyIsRetriedOnRateLimit(): void
     {
         $http = new StubHttpClient(
             StubHttpClient::error(429, 'rps_exceeded', 'часто', ['Retry-After' => '1']),
-            StubHttpClient::json(202, '{"data":{"results":[],"accepted_count":0,"failed_count":0}}'),
+            StubHttpClient::acceptedBatch(),
         );
 
-        $this->sendBatch($this->client($http));
+        $this->sendBatch($this->client($http), withoutIdempotencyKey: true);
+
+        self::assertCount(2, $http->requests);
+    }
+
+    /**
+     * Отмена повторяется после 5xx: дважды письмо не отменится, а если первая
+     * попытка дошла, повтор честно ответит 409 email_not_scheduled.
+     */
+    public function testCancelIsRetriedOnServerError(): void
+    {
+        $http = new StubHttpClient(
+            StubHttpClient::error(503, 'unavailable', 'позже'),
+            StubHttpClient::json(
+                200,
+                '{"data":{"id":"018e1b7a-1111-7000-aaaa-111111111111","status":"CANCELED","scheduled_at":null}}',
+            ),
+        );
+
+        $this->client($http)->emails->cancel('018e1b7a-1111-7000-aaaa-111111111111');
 
         self::assertCount(2, $http->requests);
     }
@@ -216,10 +257,26 @@ final class RetriesTest extends TestCase
     }
 
     /**
-     * Отсутствие ответа не значит, что сервер ничего не принял: обрыв случается
-     * и после того, как запрос дошёл и был выполнен. Для батча это запрет повтора.
+     * Сетевой сбой батча с ключом повторяется: ключ тот же, дублей не будет.
      */
-    public function testNetworkErrorIsNotRetriedForBatch(): void
+    public function testNetworkErrorIsRetriedForBatchWithKey(): void
+    {
+        $http = new StubHttpClient(
+            new TransportException('обрыв соединения'),
+            StubHttpClient::acceptedBatch(),
+        );
+
+        $this->sendBatch($this->client($http));
+
+        self::assertCount(2, $http->requests);
+    }
+
+    /**
+     * Отсутствие ответа не значит, что сервер ничего не принял: обрыв случается
+     * и после того, как запрос дошёл и был выполнен. Для батча без ключа это
+     * запрет повтора.
+     */
+    public function testNetworkErrorIsNotRetriedForBatchWithoutKey(): void
     {
         $http = new StubHttpClient(
             new TransportException('обрыв соединения'),
@@ -229,7 +286,7 @@ final class RetriesTest extends TestCase
         $this->expectException(ApiConnectionException::class);
 
         try {
-            $this->sendBatch($this->client($http));
+            $this->sendBatch($this->client($http), withoutIdempotencyKey: true);
         } finally {
             self::assertCount(1, $http->requests);
         }

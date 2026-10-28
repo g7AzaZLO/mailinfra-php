@@ -18,7 +18,8 @@ final class SendResult
 {
     /**
      * @param string $id Идентификатор письма в MailInfra.
-     * @param EmailStatus $status Статус сразу после приёма: QUEUED либо
+     * @param EmailStatus $status Статус сразу после приёма: QUEUED, SCHEDULED
+     *                            для отложенной отправки (`sendAt`) либо
      *                            SIMULATED для sandbox-ключа mi_test_….
      * @param list<array<string, string>> $skippedRecipients Получатели, которых
      *                                    API отбросил (например, адрес в списке

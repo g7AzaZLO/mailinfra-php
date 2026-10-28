@@ -12,6 +12,14 @@
  * app.services.webhook_service.sign_payload; вектора подписи общие для бэкенда
  * и всех SDK — webhook-signatures.json (в репозитории SDK — resources/).
  *
+ * Во время ротации секрета подписей две — новым секретом и прежним:
+ *
+ *     X-MailInfra-Signature: t=1715461200,v1=<новым>,v1=<прежним>
+ *
+ * Доставка принимается, если совпала любая из них. Поэтому получатель может
+ * переключиться на новый secret в любой момент окна ротации: со старым
+ * secret сойдётся вторая подпись, с новым — первая.
+ *
  * Использование:
  *
  *     use MailInfra\Webhooks;
@@ -161,7 +169,7 @@ final class Webhooks
             );
         }
 
-        [$timestamp, $provided] = self::parseHeader($signatureHeader);
+        [$timestamp, $signatures] = self::parseHeader($signatureHeader);
 
         if ($maxAgeSeconds > 0 && abs(($now ?? time()) - $timestamp) > $maxAgeSeconds) {
             throw new WebhookSignatureException(
@@ -170,27 +178,35 @@ final class Webhooks
             );
         }
 
-        // hash_equals — сравнение за постоянное время: обычное === утекает
-        // длину совпавшего префикса и позволяет подобрать подпись побайтово.
-        if (!hash_equals(self::sign($body, $secret, $timestamp), $provided)) {
-            throw new WebhookSignatureException(
-                'Подпись не совпала',
-                WebhookSignatureException::REASON_SIGNATURE_MISMATCH,
-            );
+        // Во время ротации подписей две, и верна любая: сверяем каждую, а не
+        // первую или последнюю — иначе один из секретов окна ротации молча
+        // перестал бы проходить. hash_equals — сравнение за постоянное время:
+        // обычное === утекает длину совпавшего префикса и позволяет подобрать
+        // подпись побайтово.
+        $expected = self::sign($body, $secret, $timestamp);
+        foreach ($signatures as $signature) {
+            if (hash_equals($expected, $signature)) {
+                return;
+            }
         }
+
+        throw new WebhookSignatureException(
+            'Подпись не совпала',
+            WebhookSignatureException::REASON_SIGNATURE_MISMATCH,
+        );
     }
 
     /**
-     * Разбирает заголовок вида `t=<unix>,v1=<hex>`.
+     * Разбирает заголовок вида `t=<unix>,v1=<hex>[,v1=<hex>]`.
      *
-     * @return array{int, string}
+     * @return array{int, list<string>} Момент подписи и все непустые подписи `v1`.
      *
      * @throws WebhookSignatureException
      */
     private static function parseHeader(string $signatureHeader): array
     {
         $timestamp = null;
-        $signature = null;
+        $signatures = [];
 
         foreach (explode(',', $signatureHeader) as $item) {
             $parts = explode('=', $item, 2);
@@ -204,18 +220,18 @@ final class Webhooks
             $value = trim($parts[1]);
             if ($key === 't' && preg_match('/^\d+$/', $value) === 1) {
                 $timestamp = (int) $value;
-            } elseif ($key === 'v1') {
-                $signature = $value;
+            } elseif ($key === 'v1' && $value !== '') {
+                $signatures[] = $value;
             }
         }
 
-        if ($timestamp === null || $signature === null || $signature === '') {
+        if ($timestamp === null || $signatures === []) {
             throw new WebhookSignatureException(
                 \sprintf("Заголовок %s не разобран: ожидается 't=<unix>,v1=<hex>'", self::SIGNATURE_HEADER),
                 WebhookSignatureException::REASON_MALFORMED_HEADER,
             );
         }
 
-        return [$timestamp, $signature];
+        return [$timestamp, $signatures];
     }
 }

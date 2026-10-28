@@ -29,6 +29,12 @@ final class EmailDetail
      * @param list<string>|null $replyTo
      * @param array<string, string> $headers
      * @param list<string> $tags
+     * @param array<string, string> $metadata Пары «ключ — значение», переданные
+     *                                       при отправке; пусто, если их не было.
+     * @param \DateTimeImmutable|null $scheduledAt На когда запланирована отправка;
+     *                                             null, если письмо уходило сразу.
+     * @param \DateTimeImmutable|null $expiresAt Когда истекает срок жизни письма
+     *                                           (`ttl`); null, если срок не задан.
      */
     public function __construct(
         public readonly string $id,
@@ -65,6 +71,9 @@ final class EmailDetail
         public readonly ?bool $dkimAligned,
         public readonly ?DkimSigningStatus $dkimSigningStatus,
         public readonly ?bool $dmarcAligned,
+        public readonly array $metadata = [],
+        public readonly ?\DateTimeImmutable $scheduledAt = null,
+        public readonly ?\DateTimeImmutable $expiresAt = null,
     ) {
     }
 
@@ -108,6 +117,9 @@ final class EmailDetail
             dkimAligned: Cast::nullableBool($data, 'dkim_aligned'),
             dkimSigningStatus: Cast::nullableEnum($data, 'dkim_signing_status', DkimSigningStatus::class),
             dmarcAligned: Cast::nullableBool($data, 'dmarc_aligned'),
+            metadata: Cast::stringMap($data, 'metadata'),
+            scheduledAt: Cast::nullableDateTime($data, 'scheduled_at'),
+            expiresAt: Cast::nullableDateTime($data, 'expires_at'),
         );
     }
 }

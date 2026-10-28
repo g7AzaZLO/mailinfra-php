@@ -120,6 +120,29 @@ final class StubHttpClient implements HttpClientInterface
     }
 
     /**
+     * Успешный ответ на пустой батч.
+     */
+    public static function acceptedBatch(): HttpResponse
+    {
+        return self::json(202, '{"data":{"results":[],"accepted_count":0,"failed_count":0}}');
+    }
+
+    /**
+     * Страница списка писем: `has_more` и `next_cursor` лежат рядом с `data`.
+     *
+     * @param list<array<string, mixed>> $items
+     */
+    public static function listPage(array $items = [], bool $hasMore = false, ?string $nextCursor = null): HttpResponse
+    {
+        $body = json_encode(
+            ['data' => $items, 'has_more' => $hasMore, 'next_cursor' => $nextCursor],
+            \JSON_UNESCAPED_UNICODE | \JSON_THROW_ON_ERROR,
+        );
+
+        return self::json(200, $body);
+    }
+
+    /**
      * Ответ в конверте ошибок MailInfra.
      *
      * @param array<string, string> $headers

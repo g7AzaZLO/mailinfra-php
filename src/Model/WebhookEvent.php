@@ -16,12 +16,15 @@ final class WebhookEvent
      *                   `evt_deliverability_<hex>` у `deliverability.*`,
      *                   `evt_test_ping` у тестовой отправки.
      * @param string $type Тип: `email.<событие>` у событий письма (например
-     *                     `email.bounced`), `deliverability.<инцидент>` как есть
+     *                     `email.bounced`, `email.scheduled` при планировании и
+     *                     переносе, `email.canceled` при отмене),
+     *                     `deliverability.<инцидент>` как есть
      *                     (например `deliverability.dns_degraded`), `test.ping`
      *                     у тестовой отправки из дашборда.
      * @param \DateTimeImmutable $createdAt Момент события на стороне MailInfra.
      * @param array<string, mixed> $data Полезная нагрузка. У событий письма
-     *                                   `data['email']` — письмо, `data['event']` —
+     *                                   `data['email']` — письмо (с `metadata`,
+     *                                   переданным при отправке), `data['event']` —
      *                                   специфика события (MX, IP, bounce-детали,
      *                                   URL клика). У `deliverability.*` письма нет:
      *                                   `domain_id`, `domain`, `severity`, `title`,
@@ -56,6 +59,25 @@ final class WebhookEvent
         $id = $this->email()['id'] ?? null;
 
         return \is_string($id) ? $id : null;
+    }
+
+    /**
+     * Пары «ключ — значение», переданные при отправке письма: по ним событие
+     * связывается с заказом или пользователем в вашей системе. Пусто, если
+     * письма нет или metadata не задавали.
+     *
+     * @return array<string, string>
+     */
+    public function metadata(): array
+    {
+        $metadata = $this->email()['metadata'] ?? null;
+        if (!\is_array($metadata)) {
+            return [];
+        }
+
+        // Значения по контракту строковые; чужое тут — не повод ронять
+        // обработчик вебхука, такое значение просто не попадает в результат.
+        return array_filter($metadata, static fn ($value) => \is_string($value));
     }
 
     /**

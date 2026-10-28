@@ -23,5 +23,7 @@ enum BounceCategory: string
     case ConnectionError = 'connection-error';
     case RateLimited = 'rate-limited';
     case AuthFailure = 'auth-failure';
+    /** Истёк срок жизни письма (`ttl`) — его не успели доставить. */
+    case DeliveryExpired = 'delivery-expired';
     case Unknown = 'unknown';
 }

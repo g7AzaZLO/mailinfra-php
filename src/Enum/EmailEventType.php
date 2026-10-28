@@ -12,6 +12,8 @@ namespace MailInfra\Enum;
  */
 enum EmailEventType: string
 {
+    /** Письмо запланировано или перенесено (`send_at`). */
+    case Scheduled = 'scheduled';
     case Queued = 'queued';
     case Sending = 'sending';
     case Sent = 'sent';
@@ -24,4 +26,6 @@ enum EmailEventType: string
     case Failed = 'failed';
     case Simulated = 'simulated';
     case Deferred = 'deferred';
+    /** Запланированное письмо отменено. */
+    case Canceled = 'canceled';
 }

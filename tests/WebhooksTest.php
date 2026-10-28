@@ -189,6 +189,9 @@ final class WebhooksTest extends TestCase
         yield 'пустой заголовок' => [
             'valid', 'valid', '', true, WebhookSignatureException::REASON_MALFORMED_HEADER,
         ];
+        yield 'пустая v1' => [
+            'valid', 'valid', 't=1715461200,v1=', true, WebhookSignatureException::REASON_MALFORMED_HEADER,
+        ];
         yield 'чужой secret' => [
             'valid', 'whsec_другой', 'valid', true, WebhookSignatureException::REASON_SIGNATURE_MISMATCH,
         ];
@@ -230,5 +233,80 @@ final class WebhooksTest extends TestCase
         self::assertTrue(
             Webhooks::verify($case['body'], $case['secret'], $case['signature_header'], maxAgeSeconds: 0),
         );
+    }
+
+    /**
+     * Ротация секрета: в заголовке две подписи, и доставка проходит с любым
+     * из двух секретов окна ротации — но не с посторонним.
+     *
+     * @dataProvider rotationCases
+     */
+    public function testRotationAcceptsAnyMatchingSignature(string $name, ?string $expectedReason): void
+    {
+        $case = self::vector($name);
+
+        try {
+            $event = Webhooks::constructEvent(
+                $case['body'],
+                $case['secret'],
+                $case['signature_header'],
+                now: $case['timestamp'],
+            );
+            self::assertNull($expectedReason, 'Ожидали отказ подписи');
+            self::assertSame('email.delivered', $event->type);
+        } catch (WebhookSignatureException $exception) {
+            self::assertSame($expectedReason, $exception->getReason());
+        }
+    }
+
+    /**
+     * @return iterable<string, array{string, ?string}>
+     */
+    public static function rotationCases(): iterable
+    {
+        yield 'новый secret — первая v1' => ['rotation_new_secret', null];
+        yield 'прежний secret — последняя v1' => ['rotation_previous_secret', null];
+        yield 'посторонний secret' => ['rotation_unknown_secret', WebhookSignatureException::REASON_SIGNATURE_MISMATCH];
+    }
+
+    /**
+     * Порядок подписей не важен: сверяется каждая, а не первая или последняя.
+     */
+    public function testRotationIgnoresSignatureOrder(): void
+    {
+        $new = self::vector('rotation_new_secret');
+        $previous = self::vector('rotation_previous_secret');
+        $swapped = "t={$new['timestamp']},v1={$previous['signature']},v1={$new['signature']}";
+
+        self::assertTrue(Webhooks::verify($new['body'], $new['secret'], $swapped, now: $new['timestamp']));
+        self::assertTrue(Webhooks::verify($new['body'], $previous['secret'], $swapped, now: $new['timestamp']));
+    }
+
+    /**
+     * metadata письма из вебхука — то, ради чего его передают при отправке:
+     * связать событие с заказом в своей системе.
+     */
+    public function testEventExposesEmailMetadata(): void
+    {
+        $secret = 'whsec_test';
+        $timestamp = 1_715_461_200;
+        $body = '{"id":"evt_1","type":"email.scheduled","created_at":"2026-11-01T06:00:00Z","data":{"email":'
+            . '{"id":"018e1b7a-1111-7000-aaaa-111111111111","metadata":{"order_id":"A-1024","broken":7}}}}';
+        $header = "t={$timestamp},v1=" . Webhooks::sign($body, $secret, $timestamp);
+
+        $event = Webhooks::constructEvent($body, $secret, $header, now: $timestamp);
+
+        self::assertSame('email.scheduled', $event->type);
+        // Значение не по контракту отбрасывается, а не роняет обработчик.
+        self::assertSame(['order_id' => 'A-1024'], $event->metadata());
+
+        $ping = self::vector('test_ping');
+        $pingEvent = Webhooks::constructEvent(
+            $ping['body'],
+            $ping['secret'],
+            $ping['signature_header'],
+            now: $ping['timestamp'],
+        );
+        self::assertSame([], $pingEvent->metadata());
     }
 }
